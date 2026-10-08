@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <title>シンプル掲示板</title>
+</head>
+<body>
+    <h1>スレッド一覧</h1>
+    <form action="/thread" method="post">
+        <input type="text" name="title" placeholder="スレッドタイトル" maxlength="200" required>
+        <input type="submit" value="スレッド作成">
+    </form>
+
+    <ul>
+    {% for thread in threads %}
+        <li>
+            <a href="/thread/{{ thread.id }}">{{ thread.title }}</a>
+            <span>({{ thread.post_count }}レス)</span>
+        </li>
+    {% endfor %}
+    </ul>
+
+    <nav>
+        {% if page > 1 %}
+            <a href="/?page={{ page - 1 }}">← 前へ</a>
+        {% endif %}
+        <span>ページ {{ page }} / {{ total_pages }}</span>
+        {% if page < total_pages %}
+            <a href="/?page={{ page + 1 }}">次へ →</a>
+        {% endif %}
+    </nav>
+</body>
+</html>

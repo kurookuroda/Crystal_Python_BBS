@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.pytest_cache/
+
+# SQLite（実行時に生成されるDB）
+*.db
+*.db-wal
+*.db-shm
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/

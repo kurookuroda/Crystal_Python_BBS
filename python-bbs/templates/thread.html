@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <title>{{ thread.title }}</title>
+    <style>
+        .post-body { white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>{{ thread.title }}</h1>
+    <a href="/">← 一覧に戻る</a>
+
+    <div class="posts">
+    {% for post in posts %}
+        <div class="post">
+            <strong>{{ post.name }}</strong>
+            <small>{{ post.created_at }} (UTC)</small>
+            <p class="post-body">{{ post.body }}</p>
+        </div>
+    {% endfor %}
+    </div>
+
+    <nav>
+    {% if has_next and last_post %}
+        <a href="/thread/{{ thread.id }}?cursor_time={{ last_post.created_at | urlencode }}&amp;cursor_id={{ last_post.id }}">次へ →</a>
+    {% endif %}
+    </nav>
+
+    <form action="/thread/{{ thread.id }}/post" method="post">
+        <input type="text" name="name" placeholder="名前" maxlength="100">
+        <textarea name="body" placeholder="本文" maxlength="10000" required></textarea>
+        <input type="submit" value="投稿">
+    </form>
+</body>
+</html>
