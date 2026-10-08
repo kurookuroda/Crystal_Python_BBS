@@ -1,7 +1,3 @@
-Crystal版に完全に対応するPython移植版チュートリアルを作成しました。本編と応用編の両方を含み、各StepでCrystalの設計思想をPythonの慣習でどう再現するかを対比しながら解説しています。
-
----
-
 # 【Python入門】Crystal掲示板の移植版！FastAPIとSQLiteで作る「シンプル掲示板」
 
 ## はじめに：なぜこのチュートリアルか？
@@ -15,6 +11,16 @@ Pythonは動的型付け言語ですが、**型ヒント (`typing`)**、**デー
 - Crystalチュートリアル（本編・応用編）を読了済みの方
 - PythonでのWeb開発に興味がある方
 - 「動的言語でも型の思想を活かす方法」を知りたい方
+
+### 動作確認済みの環境
+
+本記事のコードは、次の環境で実際に動かして確認しています。
+
+- Python 3.12 / FastAPI 0.143 / Starlette 1.7 / SQLite 3.45
+- 必要なバージョンの目安: Python 3.10+、SQLite 3.15+（行値比較 `(a, b) > (?, ?)` を使うため）
+
+> ⚠️ **Starlette 0.29以降の `TemplateResponse` について**
+> `TemplateResponse("index.html", {"request": request, ...})` という古い呼び出し形式は、新しいStarletteでは動きません。本記事では `TemplateResponse(request, "index.html", {...})` の形式を使います。
 
 ### 完成するプロジェクト構成（本編時点）
 
@@ -61,7 +67,7 @@ python-multipart
 
 ## Step 2: データベース接続の一元管理（シングルトンパターン）
 
-Crystalの `@@db` に相当する、スレッドセーフなDB接続管理を実装します。FastAPIはリクエストをスレッドプールで処理するため、接続を一元管理します。
+Crystalの `@@db` に相当する、DB接続の一元管理を実装します。FastAPIは通常の `def` ルートをスレッドプールで処理するため、接続の**生成**はロックで保護します（二重チェックロック）。
 
 ```python
 # database.py
@@ -111,6 +117,13 @@ class Database:
                 FOREIGN KEY (thread_id) REFERENCES bbs_threads(id)
             )
         """)
+
+        # スレッド内の取得・並べ替え・キーセットページネーションを支えるインデックス
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posts_thread_created
+            ON posts(thread_id, created_at, id)
+        """)
+
         db.commit()
 
     @classmethod
@@ -123,10 +136,10 @@ class Database:
 > 💡 **Crystalとの対比**
 > - Pythonにはコンパイル時の型チェックはありませんが、**型ヒント (`-> sqlite3.Connection`)** を付与することで、IDEの補完と静的解析ツール（mypy）の恩恵を受けられます。
 > - `sqlite3.Row` を使うと `row["title"]` のようにカラム名でアクセスでき、Crystalの `rs.read(String)` よりも安全で可読性が高くなります。
-> - `check_same_thread=False` は、スレッドプールから同一接続を共有するための設定です。`sqlite3` モジュールはネイティブレベルでロックを持つためクラッシュはしませんが、同時トランザクションが競合する可能性があります。本番規模では `aiosqlite` などの非同期ドライバへの移行を検討してください。
+> - `check_same_thread=False` は、スレッドプールから同一接続を共有するための設定です。`sqlite3` モジュールはネイティブレベルでロックを持つためクラッシュはしませんが、**`execute` と `commit` を囲むロックはありません**。ある `commit()` が別スレッドの途中のトランザクションまで確定させる可能性があります。学習用の小規模アプリなら動きますが、本番ではリクエスト単位で接続を開く（FastAPIの `Depends` を使う）か、`aiosqlite` などの非同期ドライバへの移行を検討してください。
 
 > ⚠️ **なぜ `created_at` の DEFAULT が `strftime(...'%f')` なのか？**
-> ここには先回りした罠回避が仕込まれています。詳しくは **Step 4** で解説しますが、ポイントは **`%f`（ミリ秒つき）** であること。素朴に `DEFAULT CURRENT_TIMESTAMP` と書くと、後で日時を読むときにフォーマット不一致で問題が起きます。
+> ここには先回りした罠回避が仕込まれています。詳しくは **Step 4** で解説しますが、ポイントは **`%f`（秒以下の小数部分）** であること。素朴に `DEFAULT CURRENT_TIMESTAMP` と書くと、後で日時を読むときにフォーマット不一致で問題が起きます。SQLiteの `%f` は `SS.SSS`（秒とミリ秒3桁）を出力します。
 
 ---
 
@@ -136,7 +149,6 @@ Crystalの `struct` に最も近い概念は、Python標準の `@dataclass` で�
 
 ```python
 # models.py
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -179,7 +191,7 @@ class BbsThread:
             (title, now),
         )
         db.commit()
-        return cursor.lastrowid  # ⭕ 同一接続から安全に取得
+        return cursor.lastrowid
 ```
 
 ```python
@@ -215,8 +227,8 @@ class Post:
 ```
 
 > 💡 **Crystalとの対比**
-> - **`@dataclass(frozen=True)`**: Crystalの `struct`（値型）に相当するイミュータブルなデータ入れ物です。`frozen=True` により、インスタンス生成後の書き換えが物理的に禁止されます。
-> - **`cursor.lastrowid`**: Crystalの `result.last_insert_id` と同様、**直前の `execute` と同じ接続**から取得するため、コネクションプール環境でも安全です。
+> - **`@dataclass(frozen=True)`**: Crystalの `struct`（値型）に相当するイミュータブルなデータ入れ物です。`frozen=True` により、インスタンス生成後の書き換えは `FrozenInstanceError` で拒否されます。
+> - **`cursor.lastrowid`**: Crystalの `result.last_insert_id` と同様、**直前の `execute` と同じ接続**から取得します。ただし、単一の共有接続ではGIL解放のタイミングによって理論上競合の余地があるため、本番では `INSERT ... RETURNING id`（SQLite 3.35以降）やリクエスト単位の接続管理がより堅牢です。
 > - **`Optional["BbsThread"]`**: Crystalの `BbsThread?` に相当します。型ヒントにより「見つからなければ `None`」であることが明示され、mypyなどの静的解析ツールは呼び出し側に `None` チェックを強制できます。
 > - **`COUNT(p.id)` は `int`**: Pythonの `sqlite3` では SQLite の整数はPythonの `int` として返るため、Crystalのような `Int64` からの変換は不要です。
 
@@ -241,7 +253,9 @@ db.execute(
 
 Crystal版と同様、Python側で生成した日時文字列と、SQLiteの `DEFAULT` で生成される日時文字列のフォーマットを**寸分違わず一致させる**必要があります。
 
-Pythonの `datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]` はミリ秒3桁を生成します。これをStep 2の `strftime('%Y-%m-%d %H:%M:%f', 'now')`（`%f` は秒以下の小数部分、SQLiteではミリ秒3桁＋マイクロ秒3桁…とやや複雑）と合わせるため、**Python側で明示的に挿入時の日時を渡す**ことで、読み書きのフォーマットを原理的に一致させています。
+Pythonの `datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]` はミリ秒3桁を生成します。SQLiteの `strftime('%Y-%m-%d %H:%M:%f', 'now')` の `%f` は `SS.SSS`（秒とミリ秒3桁）を出力するため、両者は一致します。**Python側で明示的に挿入時の日時を渡す**ことで、読み書きのフォーマットを原理的に一致させています。
+
+> 💡 日時はUTCで保存しています。画面に表示するときに日本時間（JST）へ変換したい場合は、表示の直前に変換してください。保存形式を揃えておくことが、ここでの要点です。
 
 ### ⚠️ 罠その2：`lastrowid` はどう取るか
 
@@ -250,9 +264,9 @@ cursor = db.execute("INSERT INTO bbs_threads (title, created_at) VALUES (?, ?)",
 return cursor.lastrowid
 ```
 
-新規作成した行のidを取りたくなりますが、やりがちな失敗はINSERTの直後に別クエリで `SELECT last_insert_rowid()` を発行することです。`Database.get_instance()` が返す接続は共有されますが、**別のリクエストスレッドが同じタイミングでINSERTを実行していた場合**、`last_insert_rowid()` は予期しない値を返す可能性があります。
+新規作成した行のidを取りたくなりますが、やりがちな失敗はINSERTの直後に別クエリで `SELECT last_insert_rowid()` を発行することです。共有接続では**別のリクエストスレッドが同じタイミングでINSERTを実行していた場合**、予期しない値を返す可能性があります。
 
-正解は、`execute` が返す `cursor` から直接 `lastrowid` を読むことです。これなら「今この `execute` でINSERTした行」のIDが確実に得られます。
+より安全なのは、`execute` が返す `cursor` から直接 `lastrowid` を読むことです。これなら「今この `execute` でINSERTした行」のIDが得られます。ただし、理論上の競合を完全に排除するには、SQLite 3.35以降で使える `INSERT ... RETURNING id` が最も堅牢です。
 
 ---
 
@@ -280,6 +294,8 @@ Database.get_instance()
 @app.get("/")
 def index(request: Request, page: Optional[int] = 1):
     page = max(1, page or 1)
+    # 異常に大きなページ番号を防ぐ上限（実用的な範囲に制限）
+    page = min(page, 999_999)
     per_page = 20
 
     # 本編では簡易的に全件取得後スライス（応用編でLIMIT/OFFSETに置き換え）
@@ -291,16 +307,19 @@ def index(request: Request, page: Optional[int] = 1):
     end = start + per_page
     paged_threads = threads[start:end]
 
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "threads": paged_threads,
-        "page": page,
-        "total_pages": total_pages,
-    })
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "threads": paged_threads,
+            "page": page,
+            "total_pages": total_pages,
+        },
+    )
 
 
 @app.post("/thread")
-def create_thread(title: str = Form(...)):
+def create_thread(title: str = Form(..., max_length=200)):
     title = title.strip()
     if title:
         BbsThread.create(title)
@@ -308,12 +327,7 @@ def create_thread(title: str = Form(...)):
 
 
 @app.get("/thread/{id}")
-def show_thread(
-    request: Request,
-    id: str,  # あえてstrで受け取り、手動で検証する（Crystal版と同じ設計思想）
-    cursor_time: Optional[str] = None,
-    cursor_id: Optional[int] = None,
-):
+def show_thread(request: Request, id: str):  # あえてstrで受け取り、手動で検証する（Crystal版と同じ設計思想）
     # ⚠️ 罠対策: パスセグメントも外部入力。int変換に失敗したら404
     try:
         thread_id = int(id)
@@ -328,18 +342,21 @@ def show_thread(
 
     posts = Post.where(thread_id)  # 本編では全件取得（応用編でキーセットに置き換え）
 
-    return templates.TemplateResponse("thread.html", {
-        "request": request,
-        "thread": thread,
-        "posts": posts,
-    })
+    return templates.TemplateResponse(
+        request,
+        "thread.html",
+        {
+            "thread": thread,
+            "posts": posts,
+        },
+    )
 
 
 @app.post("/thread/{id}/post")
 def create_post(
     id: str,
-    name: Optional[str] = Form(default=""),
-    body: str = Form(...),
+    name: Optional[str] = Form(default="", max_length=100),
+    body: str = Form(..., max_length=10_000),
 ):
     try:
         thread_id = int(id)
@@ -355,20 +372,21 @@ def create_post(
     if body:
         Post.create(thread_id, name, body)
 
-    return RedirectResponse(url=f"/thread/{id}", status_code=303)
+    return RedirectResponse(url=f"/thread/{thread_id}", status_code=303)
 ```
 
 > 💡 **Crystalとの対比**
 > - **`int(id)` と `ValueError`**: Crystalの `to_i32?` に相当します。Pythonには `?` 付きメソッドがないため、`try...except` で例外をキャッチして404を返すのが定石です。
 > - **`raise HTTPException`**: Crystalの `halt` に相当します。制御フローがそこで終了するため、その後のコードで `thread` が `None` でないことが静的解析ツールに正しく伝わります。
-> - **パスセグメントも外部入力**: `/thread/abc` のようなリクエストで `int()` が失敗する可能性を考慮し、500ではなく404を返します。URLのパス部分とはいえ、ユーザーが自由に書き換えられる点はCrystal版と同じ前提です。
-> - **PRGパターン**: POST処理の最後に `RedirectResponse`（303）を返すことで、ブラウザ更新（F5）による二重登録を防ぎます。
+> - **パスセグメントも外部入力**: `/thread/abc` のようなリクエストで `int()` が失敗する可能性を考慮し、500ではなく404を返します。なお `/thread/01` のような先頭ゼロや全角数字も `int()` は受理するため、厳密に正規化したい場合は `{id:int}` のパスコンバータを使うか、正規表現で検証してください。
+> - **入力長の制限**: `Form(..., max_length=200)` により、巨大な文字列がそのまま保存される事態を防ぎます。上限を超えた場合はFastAPIが422を返します。掲示板の用途に応じて上限値を調整してください。
+> - **PRGパターン**: POST処理の最後に `RedirectResponse`（303）を返すことで、ブラウザ更新（F5）による二重登録を防ぎます。リダイレクト先には、入力された `id` ではなく検証済みの `thread_id`（数値）を使うので、`/thread/01/post` へ投稿しても `/thread/1` に正規化されます。
 
 ---
 
 ## Step 6: テンプレートエンジン「Jinja2」とXSS対策
 
-Python標準的なテンプレートエンジン **Jinja2** を使います。RubyのERBとほぼ同じ構文です。
+Pythonで広く使われているテンプレートエンジン **Jinja2** を使います。RubyのERBに似た構文を持ちますが、フィルタや継承の仕組みがより発展しています。
 
 ```html
 <!-- templates/index.html -->
@@ -380,7 +398,7 @@ Python標準的なテンプレートエンジン **Jinja2** を使います。Ru
 <body>
     <h1>スレッド一覧</h1>
     <form action="/thread" method="post">
-        <input type="text" name="title" placeholder="スレッドタイトル" required>
+        <input type="text" name="title" placeholder="スレッドタイトル" maxlength="200" required>
         <input type="submit" value="スレッド作成">
     </form>
 
@@ -412,6 +430,9 @@ Python標準的なテンプレートエンジン **Jinja2** を使います。Ru
 <html>
 <head>
     <title>{{ thread.title }}</title>
+    <style>
+        .post-body { white-space: pre-wrap; }
+    </style>
 </head>
 <body>
     <h1>{{ thread.title }}</h1>
@@ -422,14 +443,14 @@ Python標準的なテンプレートエンジン **Jinja2** を使います。Ru
         <div class="post">
             <strong>{{ post.name }}</strong>
             <small>{{ post.created_at }}</small>
-            <p>{{ post.body }}</p>
+            <p class="post-body">{{ post.body }}</p>
         </div>
     {% endfor %}
     </div>
 
     <form action="/thread/{{ thread.id }}/post" method="post">
-        <input type="text" name="name" placeholder="名前">
-        <textarea name="body" placeholder="本文" required></textarea>
+        <input type="text" name="name" placeholder="名前" maxlength="100">
+        <textarea name="body" placeholder="本文" maxlength="10000" required></textarea>
         <input type="submit" value="投稿">
     </form>
 </body>
@@ -438,7 +459,9 @@ Python標準的なテンプレートエンジン **Jinja2** を使います。Ru
 
 > 💡 **Crystalとの対比**
 > - **`{% ... %}`**: コードを実行する（ループ・条件分岐）。**`{{ ... }}`**: 実行結果をHTMLとして出力する。
-> - **`HTML.escape` は不要**: Jinja2はデフォルトで**自動エスケープ**が有効です。Crystalで手動で `HTML.escape` を呼んでいた箇所は、テンプレート側で自動的に処理されるため、コードが cleaner になります。
+> - **`HTML.escape` は不要**: Jinja2（Starletteの `Jinja2Templates` 経由）はデフォルトで**自動エスケープ**が有効です。`<script>` を含むタイトルを投稿しても `&lt;script&gt;` と表示されることを確認済みです。Crystalで手動で `HTML.escape` を呼んでいた箇所は、テンプレート側で自動的に処理されます。
+> - **改行の保持**: `<p>{{ post.body }}</p>` だけでは、投稿本文の改行がHTML上で潰れます。CSSの `white-space: pre-wrap` を指定すると、改行をそのまま表示できます。
+> - **サーバー側とフォーム側の二重の上限**: テンプレートの `maxlength` はあくまで利便性のためで、悪意ある送信は防げません。本当の防御は、Step 5の `Form(max_length=...)` です。
 
 ---
 
@@ -454,7 +477,8 @@ uvicorn main:app --reload
 ブラウザで `http://localhost:8000` を開き、**一覧表示 → スレッド作成 → レス投稿**の一連が動くことを確認しましょう。
 
 > ⚠️ **動作確認ポイント**
-> `http://localhost:8000/thread/abc` のような無効なIDにアクセスすると、`ValueError` がキャッチされ、**500エラーではなく404エラー**が返ることを確認してください。
+> - `http://localhost:8000/thread/abc` のような無効なIDにアクセスすると、`ValueError` がキャッチされ、**500エラーではなく404エラー**が返ることを確認してください。
+> - タイトルに `<script>alert(1)</script>` を入れて作成し、スクリプトが実行されずに文字列として表示されることも確認しましょう。
 
 ---
 
@@ -463,11 +487,9 @@ uvicorn main:app --reload
 この小さな掲示板を通じて、Pythonの生態系と型の思想を学びました。
 
 1. **型ヒントによる安心感**: 実行時ではなく「書いている時」にIDEやmypyが不整合を指摘でき、意図しない `None` アクセスを減らせます。
-2. **`@dataclass(frozen=True)` の活用**: 参照型しかないPythonの中で、イミュータブルなデータ固まりを表現する方法を学びました。
-3. **セキュリティの基本**: プレースホルダによるSQLインジェクション対策、Jinja2の自動エスケープによるXSS対策。
+2. **`@dataclass(frozen=True)` の活用**: 参照型しかないPythonの中で、イミュータブルなデータの固まりを表現する方法を学びました。
+3. **セキュリティの基本**: プレースホルダによるSQLインジェクション対策、Jinja2の自動エスケープによるXSS対策、入力長の上限。
 4. **「動的言語でも防げない実行時の罠」への対処**: 日時フォーマットの不一致と、共有接続下での `lastrowid` の取り方。**ここがCrystal版からの一貫したテーマ**です。
-
----
 
 ---
 
@@ -475,7 +497,7 @@ uvicorn main:app --reload
 
 ## 記事の狙い
 
-前回は「型でも防げない罠」がテーマでした。今回は **「動くだけのコードから、スケールするコードへ」** がテーマです。素朴な `LIMIT`/`OFFSET` を出発点に、なぜそれが破綻するのかを実演し、実務で使われるキーセット（カーソル）方式へ書き換えます。
+前回は「型でも防げない罠」がテーマでした。今回は **「動くだけのコードから、スケールするコードへ」** がテーマです。素朴な `LIMIT`/`OFFSET` を出発点に、なぜそれが破綻するのかを実測し、実務で使われるキーセット（カーソル）方式へ書き換えます。
 
 ### 想定読者・前提
 
@@ -488,40 +510,44 @@ uvicorn main:app --reload
 
 ```python
 # scripts/seed.py
-import sys
 import random
-from datetime import datetime, timezone, timedelta
+import sys
+from datetime import datetime, timedelta, timezone
 
-sys.path.append("..")
+sys.path.insert(0, ".")  # プロジェクトルートから実行する前提
 from database import Database
 
 
+def fmt(dt: datetime) -> str:
+    """本編のcreated_atと同じ形式（ミリ秒3桁）に整形する。"""
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
 def main():
-    Database.setup()
     db = Database.get_instance()
     print("シードデータを投入中...")
 
-    # スレッドを50件作成
-    thread_ids = []
+    now = datetime.now(timezone.utc)
+
+    # スレッドを50件作成（古いスレッドから順に）
+    threads = []
     for i in range(50):
-        now = (datetime.now(timezone.utc) - timedelta(hours=(50 - i))).strftime(
-            "%Y-%m-%d %H:%M:%S.%f"
-        )[:-3]
+        created = now - timedelta(hours=(50 - i))
         cursor = db.execute(
             "INSERT INTO bbs_threads (title, created_at) VALUES (?, ?)",
-            (f"テストスレッド {i + 1}", now),
+            (f"テストスレッド {i + 1}", fmt(created)),
         )
-        thread_ids.append(cursor.lastrowid)
+        threads.append((cursor.lastrowid, created))
 
     # 各スレッドに10〜200件のレスをランダムに投入（合計 約5000件）
-    for tid in thread_ids:
+    # レスの日時は「スレッド作成時刻 〜 現在」の間に収める
+    for tid, created in threads:
+        span_ms = int((now - created).total_seconds() * 1000)
         for j in range(random.randint(10, 200)):
-            now = (datetime.now(timezone.utc) - timedelta(hours=random.randint(0, 49))).strftime(
-                "%Y-%m-%d %H:%M:%S.%f"
-            )[:-3]
+            posted = created + timedelta(milliseconds=random.randint(0, span_ms))
             db.execute(
                 "INSERT INTO posts (thread_id, name, body, created_at) VALUES (?, ?, ?, ?)",
-                (tid, f"名無しさん{j}", f"テスト投稿本文 {j} 番目です。" * random.randint(1, 5), now),
+                (tid, f"名無しさん{j}", f"テスト投稿本文 {j} 番目です。\n" * random.randint(1, 5), fmt(posted)),
             )
 
     db.commit()
@@ -538,7 +564,8 @@ python scripts/seed.py
 ```
 
 > 💡 **学習ポイント**
-> - `datetime.now(timezone.utc) - timedelta(hours=N)` で過去日時を作り、`created_at` にばらつきを持たせています（全件同時刻だとソート挙動の確認がしづらいため）。
+> - `sys.path.insert(0, ".")` でプロジェクトルートをPythonパスに追加しているので、**プロジェクトルートで** `python scripts/seed.py` と実行すれば `from database import Database` が解決します。別のディレクトリから実行すると、`bbs.db` も別の場所に作られてしまう点に注意してください。
+> - レスの日時を「所属スレッドの作成時刻以降」に収めているのは、「スレッドより古いレス」という現実にありえないデータでソート結果を確認すると、混乱するからです。
 > - 意図的に投稿数を偏らせて（10〜200件）、大きいスレッドと小さいスレッドの両方をページネーション対象にしています。
 
 ---
@@ -571,8 +598,10 @@ class BbsThread:
         db = Database.get_instance()
         cursor = db.execute("SELECT COUNT(*) FROM bbs_threads")
         return cursor.fetchone()[0]
+```
 
-
+```python
+# models.py（続き）
 @dataclass(frozen=True)
 class Post:
     # ...（既存）
@@ -606,25 +635,25 @@ class Post:
 @app.get("/")
 def index(request: Request, page: Optional[int] = 1):
     page = max(1, page or 1)
+    page = min(page, 999_999)  # 実用的な上限
     per_page = 20
 
     threads = BbsThread.paginate(page, per_page)
     total = BbsThread.count()
     total_pages = max(1, (total + per_page - 1) // per_page)
 
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "threads": threads,
-        "page": page,
-        "total_pages": total_pages,
-    })
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "threads": threads,
+            "page": page,
+            "total_pages": total_pages,
+        },
+    )
 ```
 
-### テンプレート側：ページネーションUI
-
-```html
-<!-- templates/index.html（末尾のnavはそのまま利用可能） -->
-```
+`templates/index.html` の末尾にある `<nav>`（前へ／次へ）は、本編のものをそのまま使えます。
 
 > 💡 **学習ポイント**
 > - `(page - 1) * per_page` で `offset` を計算。page=1のときoffset=0、page=2のときoffset=20…という単純な仕組みです。
@@ -636,11 +665,15 @@ def index(request: Request, page: Optional[int] = 1):
 
 ### `EXPLAIN QUERY PLAN` で内部動作を見る
 
+本編の `_setup` ではすでにインデックスを作っています。まず「インデックスがない場合」の動きを見るために、一時的にインデックスを外して確認しましょう。
+
 ```bash
 sqlite3 bbs.db
 ```
 
 ```sql
+DROP INDEX IF EXISTS idx_posts_thread_created;
+
 EXPLAIN QUERY PLAN
 SELECT id, thread_id, name, body, created_at
 FROM posts WHERE thread_id = 5
@@ -648,70 +681,134 @@ ORDER BY created_at ASC, id ASC
 LIMIT 30 OFFSET 3000;
 ```
 
-実行結果はおおよそこうなります（インデックス未設定の場合）:
+実行結果（SQLite 3.45で確認）:
 
 ```text
 QUERY PLAN
-`--SCAN posts
-   `--USE TEMP B-TREE FOR ORDER BY
+|--SCAN posts
+`--USE TEMP B-TREE FOR ORDER BY
 ```
 
-`SCAN posts` とある通り、SQLiteは**該当スレッドの全レスをスキャンし、ソートしてから、先頭3000件を読み捨てて**やっと31件目〜60件目を返しています。`OFFSET` はDB側にとって「読んでから捨てる」処理であって、「読まずに飛ばす」処理ではない、というのがこの罠の本質です。
+`SCAN posts` とある通り、SQLiteは**全レスをスキャンし、該当スレッドの行を集めて並べ替えてから、先頭3000件を読み捨てて**やっと3001件目以降を返しています。`OFFSET` はDB側にとって「読んでから捨てる」処理であって、「読まずに飛ばす」処理ではない、というのがこの罠の本質です。
 
-> 💡 **学習ポイント**
-> - `OFFSET` が大きいほど「捨てる行」が増える → 計算量はほぼ `O(offset)` で増加します。
-> - `LIMIT` だけなら早期に打ち切れますが、`OFFSET` 込みだとその手前まで律儀に処理する必要があります。
+> ⚠️ 確認が終わったら、アプリを再起動してください。`_setup` の `CREATE INDEX IF NOT EXISTS` により、外したインデックスが自動で復活します。
 
 ### インデックスを張っても本質は変わらない
 
-```sql
-CREATE INDEX idx_posts_thread_created ON posts(thread_id, created_at, id);
+インデックスがある状態（本編の通常状態）で同じクエリを調べます。
+
+```text
+QUERY PLAN
+`--SEARCH posts USING INDEX idx_posts_thread_created (thread_id=?)
 ```
 
-インデックスを張ると `SCAN` は `SEARCH` に変わり定数倍は速くなりますが、**「offset分だけインデックスを辿って読み捨てる」処理自体は残ります**。根本的な非対称性（offsetが大きいほど遅い）は解消しません。
+`SCAN` が `SEARCH` に変わり、`TEMP B-TREE`（並べ替え）も消えるので、定数倍は速くなります。しかし、**「offset分だけインデックスを辿って読み捨てる」処理自体は残ります**。根本的な非対称性（offsetが大きいほど遅い）は解消しません。
 
 ### ベンチマークで実際に体感する
 
+1スレッドに20万件を入れた専用DB（`bench.db`）で、OFFSET方式とキーセット方式（Step 4で解説）を比べます。本編の `bbs.db` は汚しません。
+
 ```python
 # scripts/benchmark_offset.py
-import sys
+"""OFFSET方式とキーセット方式を、20万件のスレッドで比較する。
+本編のDB(bbs.db)は汚さず、専用の bench.db を作って測る。"""
+import os
+import sqlite3
+import statistics
 import time
+from datetime import datetime, timedelta, timezone
 
-sys.path.append("..")
-from database import Database
-from models import Post
+DB_PATH = "bench.db"
+TOTAL = 200_000
+PER_PAGE = 30
+OFFSETS = [0, 1_000, 10_000, 50_000, 100_000, 190_000]
 
-Database.setup()
+if os.path.exists(DB_PATH):
+    os.remove(DB_PATH)
 
-thread_id = 1  # シードで200件近く投稿がある想定のスレッドを選ぶ
+db = sqlite3.connect(DB_PATH)
+db.execute("""CREATE TABLE posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""")
+db.execute("CREATE INDEX idx_posts_thread_created ON posts(thread_id, created_at, id)")
 
-for page in [1, 2, 3, 5, 10, 50, 100]:
-    start = time.perf_counter()
-    Post.paginate(thread_id, page, 30)
-    elapsed = (time.perf_counter() - start) * 1000
-    offset = (page - 1) * 30
-    print(f"page={str(page).rjust(3)}  offset={str(offset).rjust(5)}  {elapsed:.3f}ms")
+# 1スレッドに20万件を投入（10ms刻み）
+base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+rows = (
+    (1, f"名無しさん{i}", "ベンチマーク用の本文です。",
+     (base + timedelta(milliseconds=10 * i)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
+    for i in range(TOTAL)
+)
+db.executemany("INSERT INTO posts (thread_id, name, body, created_at) VALUES (?, ?, ?, ?)", rows)
+db.commit()
+print(f"投入完了: {TOTAL:,}件 / SQLite {sqlite3.sqlite_version}\n")
+
+OFFSET_SQL = """SELECT id, thread_id, name, body, created_at FROM posts
+                WHERE thread_id = ? ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"""
+KEYSET_SQL = """SELECT id, thread_id, name, body, created_at FROM posts
+                WHERE thread_id = ? AND (created_at, id) > (?, ?)
+                ORDER BY created_at ASC, id ASC LIMIT ?"""
+
+
+def measure(sql: str, params: tuple, runs: int = 7) -> float:
+    times = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        db.execute(sql, params).fetchall()
+        times.append((time.perf_counter() - start) * 1000)
+    return statistics.median(times)
+
+
+print(f"{'offset':>8} | {'OFFSET方式':>12} | {'キーセット方式':>14}")
+print("-" * 42)
+for off in OFFSETS:
+    if off == 0:
+        t_off = measure(OFFSET_SQL, (1, PER_PAGE, 0))
+        t_key = measure(
+            "SELECT id, thread_id, name, body, created_at FROM posts "
+            "WHERE thread_id = ? ORDER BY created_at ASC, id ASC LIMIT ?",
+            (1, PER_PAGE),
+        )
+    else:
+        # offset位置の直前の行を「前ページの最後の行（カーソル）」にする
+        cur_time, cur_id = db.execute(
+            "SELECT created_at, id FROM posts WHERE thread_id = ? "
+            "ORDER BY created_at ASC, id ASC LIMIT 1 OFFSET ?",
+            (1, off - 1),
+        ).fetchone()
+        t_off = measure(OFFSET_SQL, (1, PER_PAGE, off))
+        t_key = measure(KEYSET_SQL, (1, cur_time, cur_id, PER_PAGE))
+    print(f"{off:>8,} | {t_off:>9.3f} ms | {t_key:>11.3f} ms")
+
+db.close()
 ```
 
 ```bash
 python scripts/benchmark_offset.py
 ```
 
-実行結果のイメージ（件数や環境によって変わりますが、傾向として）:
+筆者の環境（SQLite 3.45.1、20万件、各条件7回の中央値）での実測結果です。数値は環境によって変わりますが、傾向は再現します。
 
 ```text
-page=  1  offset=    0  0.412ms
-page=  2  offset=   30  0.398ms
-page=  3  offset=   60  0.455ms
-page=  5  offset=  120  0.601ms
-page= 10  offset=  270  0.892ms
-page= 50  offset= 1470  3.214ms
-page=100  offset= 2970  6.887ms
+  offset |     OFFSET方式 |        キーセット方式
+------------------------------------------
+       0 |     0.046 ms |       0.046 ms
+   1,000 |     0.139 ms |       0.049 ms
+  10,000 |     0.782 ms |       0.060 ms
+  50,000 |     3.986 ms |       0.066 ms
+ 100,000 |     7.440 ms |       0.048 ms
+ 190,000 |    13.862 ms |       0.048 ms
 ```
 
 > 💡 **学習ポイント**
-> - この記事のデータ量（1スレッドあたり最大200件）では数ミリ秒の差にとどまりますが、**offsetと処理時間がほぼ線形に伸びている**のがわかります。データが数十万件規模になると、この傾きがそのまま体感できる遅さに直結します。
-> - 掲示板のように「みんな最初の数ページしか見ない」UIでは実害が小さく見えがちですが、**クローラーやbotが `?page=9999` のようなURLを機械的に叩くケース**では、OFFSETの重さがサーバー負荷に直結します。ここが「動いてるから大丈夫」で見過ごされやすい落とし穴です。
+> - OFFSET方式は **offsetにほぼ比例して遅くなります**（1,000で0.14ms → 190,000で13.9ms）。一方、キーセット方式は0.05ms前後でほぼ一定です。
+> - 1回あたりは数ミリ秒でも、掲示板のように**アクセスが集中する場所**や、**クローラーやbotが `?page=9999` のようなURLを機械的に叩くケース**では、この差がサーバー負荷に直結します。「動いてるから大丈夫」で見過ごされやすい落とし穴です。
+> - 「みんな最初の数ページしか見ない」UIでは実害が小さく見えがちですが、**深いページへのアクセスを防げない以上、最悪ケースの性能で設計する**のが安全です。
+> - 本編のシード（最大200件程度）では差がほとんど出ません。これは測定対象が小さすぎるためで、**ベンチマークは意味のあるデータ量で行う**必要があります。
 
 ### この章のまとめ
 
@@ -732,14 +829,25 @@ OFFSET方式は「何件目から」という**位置**で指定していまし�
 SELECT ... FROM posts WHERE thread_id = ?
 ORDER BY created_at ASC, id ASC LIMIT 30 OFFSET 3000;
 
--- ⭕ キーセット方式: インデックスで一発に絞り込める
+-- ⭕ キーセット方式: インデックスで基準点まで直接ジャンプできる
 SELECT ... FROM posts WHERE thread_id = ?
-  AND (created_at > ? OR (created_at = ? AND id > ?))  -- 前ページ最後の行の(created_at, id)
+  AND (created_at, id) > (?, ?)  -- 前ページ最後の行の(created_at, id)
 ORDER BY created_at ASC, id ASC LIMIT 30;
 ```
 
 > 💡 **なぜ `id` もタイブレークに使うのか**
 > 本編で `created_at` の DEFAULT を `strftime('%Y-%m-%d %H:%M:%f', 'now')` にしてミリ秒まで持たせたのを覚えているでしょうか。それでも**同一ミリ秒に複数投稿が発生する可能性はゼロではありません**。`created_at` だけで比較すると、同時刻の行の順序が不定になったり、取りこぼしたりする危険があります。`(created_at, id)` の複合比較にすることで、`created_at` が同値でも `id` の昇順で一意に順序が決まり、ページの境界がブレなくなります。これが本編の設計判断がここで回収される部分です。
+
+### SQLiteでの行値比較
+
+SQLiteは **行値式（row value）** として `(created_at, id) > (?, ?)` という比較をそのままサポートしています（SQLite 3.15以降）。同じ意味のOR形式 `(created_at > ? OR (created_at = ? AND id > ?))` もありますが、`EXPLAIN QUERY PLAN` で確認すると違いが出ます。
+
+```text
+-- OR形式:     SEARCH posts USING COVERING INDEX idx_posts_thread_created (thread_id=?)
+-- 行値比較:   SEARCH posts USING COVERING INDEX idx_posts_thread_created (thread_id=? AND created_at>?)
+```
+
+OR形式ではインデックスが `thread_id` までしか使われませんが、行値比較なら `created_at` の範囲条件までインデックスで絞り込めます。可読性も高いため、本記事では行値比較を採用します。
 
 ### モデル層：カーソルベースの `after`
 
@@ -763,10 +871,10 @@ class Post:
             cursor = db.execute(
                 """SELECT id, thread_id, name, body, created_at FROM posts
                    WHERE thread_id = ?
-                     AND (created_at > ? OR (created_at = ? AND id > ?))
+                     AND (created_at, id) > (?, ?)
                    ORDER BY created_at ASC, id ASC
                    LIMIT ?""",
-                (thread_id, cursor_time, cursor_time, cursor_id, per_page),
+                (thread_id, cursor_time, cursor_id, per_page),
             )
         else:
             # カーソルなし = 先頭ページ
@@ -787,9 +895,9 @@ class Post:
             """SELECT EXISTS(
                  SELECT 1 FROM posts
                  WHERE thread_id = ?
-                   AND (created_at > ? OR (created_at = ? AND id > ?))
+                   AND (created_at, id) > (?, ?)
                )""",
-            (thread_id, last_created_at, last_created_at, last_id),
+            (thread_id, last_created_at, last_id),
         )
         return cursor.fetchone()[0] == 1
 ```
@@ -804,14 +912,17 @@ class Post:
 
 ```python
 # main.py（スレッド表示ルートを書き換え）
+from datetime import datetime
+
+
 @app.get("/thread/{id}")
 def show_thread(
     request: Request,
     id: str,
     cursor_time: Optional[str] = None,
-    cursor_id: Optional[int] = None,
+    cursor_id: Optional[str] = None,  # intではなくstrで受け取り、手動で検証する
 ):
-    # 本編と同じく、:id が数値でなければ try/except + HTTPException で早期リターン
+    # 本編と同じく、id が数値でなければ try/except + HTTPException で早期リターン
     try:
         thread_id = int(id)
     except ValueError:
@@ -823,37 +934,59 @@ def show_thread(
 
     # ここ以降、thread は None でないことが保証される
 
+    # ⚠️ 罠その3: URLパラメータも外部入力。不正なカーソルは先頭ページにフォールバック
+    validated_cursor_time: Optional[str] = None
+    validated_cursor_id: Optional[int] = None
+
+    if cursor_time and cursor_id:
+        try:
+            parsed_id = int(cursor_id)
+            # フォーマット検証（例: 2026-09-03 12:34:56.789）
+            datetime.strptime(cursor_time, "%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            parsed_id = None
+
+        # SQLiteのINTEGERは64bit符号付き。範囲外の値はOverflowError（500）になるため弾く
+        if parsed_id is not None and 0 < parsed_id < 2**63:
+            validated_cursor_time = cursor_time
+            validated_cursor_id = parsed_id
+
     per_page = 30
-    posts = Post.after(thread_id, cursor_time, cursor_id, per_page)
+    posts = Post.after(thread_id, validated_cursor_time, validated_cursor_id, per_page)
 
     has_next = False
     if posts:
         last_post = posts[-1]
         has_next = Post.has_more(thread_id, last_post.created_at, last_post.id)
 
-    return templates.TemplateResponse("thread.html", {
-        "request": request,
-        "thread": thread,
-        "posts": posts,
-        "has_next": has_next,
-        "last_post": posts[-1] if posts else None,
-    })
+    return templates.TemplateResponse(
+        request,
+        "thread.html",
+        {
+            "thread": thread,
+            "posts": posts,
+            "has_next": has_next,
+            "last_post": posts[-1] if posts else None,
+        },
+    )
 ```
 
 > ⚠️ **罠その3：URLパラメータは「ユーザーが自由に改ざんできる」**
-> `cursor_time` はURLクエリパラメータです。つまりブラウザだけでなく、クローラーや悪意あるアクセスが `?cursor_time=invalid_string` のような**不正な値**を直接送ってくる可能性を常に考慮する必要があります。
+> `cursor_time` と `cursor_id` はURLクエリパラメータです。つまりブラウザだけでなく、クローラーや悪意あるアクセスが `?cursor_time=invalid_string&cursor_id=abc` のような**不正な値**を直接送ってくる可能性を常に考慮する必要があります。
 >
-> 上のコードでは `cursor_time` を `str` として受け取り、モデル層の `Post.after` でSQLの比較に渡しています。SQLiteはTEXTの比較を行うため、不正な文字列が入ってもSQLエラーにはなりませんが、意図しない順序で結果が返る可能性があります。
+> 上のコードでは、`cursor_id` を `Optional[int]` ではなく **`str` で受け取り**、自分で `int()` 変換と日時の `strptime` 検証を行います。`Optional[int]` のままだと、FastAPIが不正値に対して自動で **422 Unprocessable Entity** を返してしまい、「先頭ページへのフォールバック」にならないためです。検証に失敗したときは、カーソルを無効化して先頭ページを表示します。
 >
-> より厳密には、`cursor_time` が期待する日時フォーマット（`%Y-%m-%d %H:%M:%S.%f`）にマッチするかを正規表現や `datetime.strptime` で検証し、不正な場合は `None` として「先頭ページにフォールバック」するのが安全です。**「外部から来た値は常に汚染されている可能性がある」** というWeb開発の鉄則を、Pythonの `Optional` 型と例外処理の両方で受け止めている形です。
+> さらに `0 < parsed_id < 2**63` の範囲チェックも必要です。`?cursor_id=1180591620717411303424`（2の70乗）のような巨大な値はPythonの `int()` は通りますが、SQLiteに渡すと `OverflowError` で500エラーになります。**「型として正しい」ことと「使える範囲にある」ことは別**、というのがこの罠の要点です。
+>
+> **「外部から来た値は常に汚染されている可能性がある」** というWeb開発の鉄則を、Pythonの `Optional` 型と例外処理の両方で受け止めている形です。
 
 ### テンプレート側：カーソルリンクの生成
 
 ```html
-<!-- templates/thread.html（末尾に追加） -->
+<!-- templates/thread.html（</body> の直前に追加） -->
 <nav>
   {% if has_next and last_post %}
-    <!-- URLエンコードはJinja2の urlencode フィルタが自動で行う -->
+    <!-- URLエンコードはJinja2の urlencode フィルタで行う -->
     <a href="/thread/{{ thread.id }}?cursor_time={{ last_post.created_at | urlencode }}&cursor_id={{ last_post.id }}">
       次へ →
     </a>
@@ -862,8 +995,7 @@ def show_thread(
 ```
 
 > 💡 **学習ポイント：カーソル値はURLエンコードする**
-> `%Y-%m-%d %H:%M:%S.%L` でフォーマットした文字列には**スペース**が含まれます（例: `2026-09-03 12:34:56.789`）。URL内にスペースを裸のまま含めるのはHTTPの作法として厳密には正しくありません。Jinja2の `| urlencode` フィルタでエンコードしてからリンクに埋め込むのが正攻法です。
-> ※ `urlencode` はスペースを `%20` または `+` に変換しますが、FastAPI（およびHTTPのクエリパース）は `+` をスペースとして復元するため、ラウンドトリップは正しく成立します。
+> `%Y-%m-%d %H:%M:%S.%f` でフォーマットした文字列には**スペース**が含まれます（例: `2026-10-08 18:10:22.931`）。URL内にスペースを裸のまま含めるのはHTTPの作法として厳密には正しくありません。Jinja2の `| urlencode` フィルタでエンコードしてからリンクに埋め込むのが正攻法です（実際には `2026-10-08%2018%3A10%3A22.931` のようになります）。FastAPI側はクエリ文字列を自動でデコードするため、ラウンドトリップは正しく成立します。
 
 > 💡 **学習ポイント：トレードオフの明示**
 > このUIには「前へ」ボタンがありません。キーセット方式は本質的に**片方向（次へ）が得意**で、「前へ」を実装するには「逆順にLIMIT件取得して、結果をひっくり返す」という別クエリが必要になります（発展課題として次回以降に回せます）。同様に「12ページ目へジャンプ」もできません。**「無限スクロール」や「もっと見る」ボタンのUIとは非常に相性が良い一方、ページ番号ナビゲーションが必要な場面には向かない**、という使い分けがここではっきり見えてきます。
@@ -876,8 +1008,8 @@ def show_thread(
 |---|---|---|
 | ページ番号ジャンプ（3ページ目へ） | ◯ できる | ✕ できない（次へ/前へのみ） |
 | 総ページ数の表示 | ◯ `COUNT` で出せる | △ 別クエリが必要、頻繁な表示には不向き |
-| 後方ページの速度 | ✕ offsetに比例して劣化 | ◯ 常に一定 |
-| 実装の複雑さ | ◯ シンプル | △ カーソルの受け渡し・パース処理が増える |
+| 後方ページの速度 | ✕ offsetに比例して劣化（Step 3で実測） | ◯ 常に一定 |
+| 実装の複雑さ | ◯ シンプル | △ カーソルの受け渡し・検証処理が増える |
 | 途中でデータが増減した場合の一貫性 | ✕ ページがズレる（新規投稿で1件目が繰り上がる等） | ◯ カーソル基準なので影響を受けにくい |
 
 ### 使い分けの指針
@@ -887,7 +1019,7 @@ def show_thread(
 - **検索結果に近いが件数が多い場合（数万件規模）** → ハイブリッド案。先頭数ページ（例: 1〜10ページ）はOFFSETで許容し、それ以降は「もっと見る」ボタンでキーセット方式に切り替える、という設計も現実的。
 
 > 💡 **学習ポイント：「一貫性の崩れ」も実は罠の一種**
-> OFFSET方式には性能面だけでなく、**表示内容の一貫性が崩れる**という見落とされがちな問題があります。1ページ目を見ている間に新しいレスが投稿されると、2ページ目に進んだときに「1ページ目で見たはずの投稿」が再度表示されたり、逆に1件飛ばされたりします（offsetは「順位」で切っているため、順位そのものがズレる）。キーセット方式は「前回見た行より後ろ」という相対条件なので、この種のズレが原理的に起きません。これも本編からの一貫したテーマである「動的言語でも静的型付けでも防げない、設計に起因する罠」の一例です。
+> OFFSET方式には性能面だけでなく、**表示内容の一貫性が崩れる**という見落とされがちな問題があります。1ページ目を見ている間に新しいレスが投稿されると、2ページ目に進んだときに「1ページ目で見たはずの投稿」が再度表示されたり、逆に1件飛ばされたりします（offsetは「順位」で切っているため、順位そのものがズレる）。キーセット方式は「前回見た行より後ろ」という相対条件なので、この種のズレが原理的に起きません。これが本編からの一貫したテーマである「動的言語でも静的型付けでも防げない、設計に起因する罠」の一例です。
 
 ---
 
@@ -895,12 +1027,14 @@ def show_thread(
 
 ### スレッド一覧側もキーセット方式に統一するか？
 
-スレッド一覧（`BbsThread`）側は `GROUP BY` + `COUNT` が絡むため、単純な複合条件比較では書けません（集計後の値でカーソルを組む必要がある）。この記事では:
+スレッド一覧（`BbsThread`）側は `GROUP BY` + `COUNT` が絡むため、集計後の値でカーソルを組む必要があるように見えます。しかし、ソートキーは `created_at` と `id` であり、どちらも集計前のテーブルに存在する列です。ソートキー自体が集計値でなければ、`(created_at, id)` の複合比較でキーセットページネーションを実装できます。
+
+したがって、この記事での使い分けは「技術的にできないから」ではなく、**用途に応じた設計判断**です。
 
 - **スレッド一覧** → OFFSET方式のまま（Step 2の実装を維持。ページ番号ジャンプの利便性を優先する判断）
 - **レス一覧** → キーセット方式（Step 4の実装。件数が青天井に増えるため）
 
-という**使い分けそのものを最終形**として採用します。両方を無理に同じ方式に揃えないのが、Step 5で整理した指針の実践例になっています。
+両方を無理に同じ方式に揃えないのが、Step 5で整理した指針の実践例になっています。なお、レスが付くたびに上に上がる「bump順」の一覧にしたい場合は、ソートキーが集計値（最終レス日時）になるため、キーセット方式の設計は一段難しくなります。
 
 ### 最終的なディレクトリ構成（応用編で追加されたファイル）
 
@@ -908,47 +1042,44 @@ def show_thread(
 python-bbs/
 ├── scripts/
 │   ├── seed.py              # 追加: シードデータ投入
-│   └── benchmark_offset.py  # 追加: OFFSETベンチマーク
+│   └── benchmark_offset.py  # 追加: OFFSET/キーセットの比較ベンチマーク（bench.dbを生成）
 ├── templates/
 │   ├── index.html
 │   └── thread.html          # 変更: キーセット版「次へ」リンク追加
-├── database.py
+├── database.py              # 本編時点でインデックス作成済み
 ├── models.py                # 変更: paginate, after, has_more 追加
-├── main.py                  # 変更: page/cursorパラメータ対応
+├── main.py                  # 変更: page/cursorパラメータ対応、カーソル検証
 └── requirements.txt
 ```
 
 ### 通し動作確認の手順
 
 ```bash
-python scripts/seed.py   # シード投入（スレッド50件、レス計約5000件）
-uvicorn main:app --reload # サーバー起動
+python scripts/seed.py     # シード投入（スレッド50件、レス計約5000件）
+uvicorn main:app --reload  # サーバー起動
 ```
 
 1. `http://localhost:8000` でスレッド一覧を開き、`?page=2` などでOFFSETページネーションが動くことを確認
-2. 投稿数の多いスレッドを開き、「次へ」を連打してキーセットページネーションが最後まで正しく進むことを確認
-3. `python scripts/benchmark_offset.py` で、OFFSET方式の速度劣化を再確認
+2. 投稿数の多いスレッドを開き、「次へ」を最後まで押して、**全レスが漏れなく・重複なく**表示されることを確認（筆者の環境では、198件のスレッドが30件×6ページ＋18件の7ページで198件になることを確認）
+3. `python scripts/benchmark_offset.py` で、OFFSET方式の速度劣化とキーセット方式の安定性を確認
+4. `?cursor_id=abc` や `?cursor_time=invalid` を手動でURLに入れても、**422ではなく先頭ページにフォールバック**することを確認
+5. `?cursor_time=2026-01-01%2000:00:00.000&cursor_id=1180591620717411303424` のような巨大な値でも**500にならない**ことを確認
 
 ### まとめ：応用編で得られたもの
 
 1. **`EXPLAIN QUERY PLAN` でDB内部の動作を可視化する習慣** — 「動いている」と「効率的に動いている」は別物だと体で理解する
-2. **OFFSETは読み捨て、キーセットは基準点からの絞り込み** — この違いが性能特性の非対称性を生む
-3. **本編の設計判断（ミリ秒つき日時、`lastrowid` の取り方）が応用編で回収される構成** — 一見小さな設計判断が後の機能追加を左右する好例
+2. **OFFSETは読み捨て、キーセットは基準点からの絞り込み** — この違いが性能特性の非対称性を生む（20万件の実測で、offset 190,000では約13.9msと約0.05msの差）
+3. **本編の設計判断（ミリ秒つき日時、インデックス、`lastrowid` の取り方）が応用編で回収される構成** — 一見小さな設計判断が後の機能追加を左右する好例
 4. **「どちらか一方が正解」ではなく、用途に応じた使い分けが実務的な結論** — スレッド一覧はOFFSET、レス一覧はキーセットという非対称な採用がそれを体現している
+5. **外部入力は「型」だけでなく「範囲」も検証する** — `int()` を通っても、SQLiteの64bit範囲外なら500になる
 
 ### 次のステップ（さらなる応用へ）
 
 - **「前へ」ボタンの実装**: 逆順クエリ + 結果の反転
 - **バリデーション**: Pydantic を使ったリクエストスキーマの厳格化
-- **非同期化**: `aiosqlite` を使った非同期DBアクセス
+- **非同期化・接続管理**: `aiosqlite` を使った非同期DBアクセス、およびリクエスト単位の接続管理
 - **設定の外部化**: DBパスやポートを環境変数（`pydantic-settings` など）から読む
 
 ---
 
 *(※この記事は Python 3.10+ および FastAPI の最新バージョンをベースに構成しています。ライブラリの仕様は更新される場合があるため、公式ドキュメントも併せてご確認ください。)*
-
----
-
-以上が、Crystal版に完全対応したPython移植版チュートリアルです。FastAPIの型ヒントと例外処理、Python標準の `sqlite3` と `dataclass` を使うことで、Crystalのチュートリアルで培った設計思想を損なわずに再現できています。
-
-もしこの記事をHTMLファイルやMarkdownファイルとして書き出したい場合は、お知らせください。
