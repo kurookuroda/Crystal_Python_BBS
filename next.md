@@ -1,3 +1,7 @@
+ご指摘の4点（接続数の説明、メディアポリシーのトーン、`noTLSVerify` コメント、Grants の `groups` 定義漏れ）をすべて反映し、公式ドキュメントで裏付けを確認した上でガイド全体を修正しました。
+
+---
+
 # PythonBBS 本番運用ガイド — Tailscale + Cloudflare Tunnel でオリジンを秘匿する
 
 ローカルで動く掲示板を、ポート開放なし・固定IP不要でインターネットに公開する。リバースプロキシの概念を Tailscale と Cloudflare Tunnel で段階的に理解し、オリジンサーバーのIPを完全に隠す構成を実践する。
@@ -84,6 +88,7 @@ cloudflared tunnel create pythonbbs
 - `<UUID>.json` はトンネル固有の認証情報です
 
 ```bash
+chmod 700 ~/.cloudflared
 chmod 600 ~/.cloudflared/cert.pem
 chmod 600 ~/.cloudflared/<UUID>.json
 ```
@@ -101,14 +106,18 @@ ingress:
     service: http://localhost:8000
     originRequest:
       connectTimeout: 30s
-      # ローカルの http:// 接続なので、TLS 検証は不要（かつ明示的に無効化する必要がある）
-      noTLSVerify: true
+      # HTTPS origin の場合に証明書検証を無効化するオプション。
+      # HTTP origin (http://) では TLS ハンドシェイク自体が発生しないため不要。
+      noTLSVerify: false
 
   # 最後のルールは必ず catch-all
   - service: http_status:404
 ```
 
 **ingress ルールの評価順序:** 上から下に評価され、**最後のルールは必ず catch-all（hostname も path も指定しない）**でなければ `cloudflared` は起動を拒否します。
+
+> **`noTLSVerify` について**
+> このオプションは **HTTPS オリジン**の証明書検証を無効化するものです。HTTP オリジン（`http://localhost:8000`）では TLS ハンドシェイク自体が発生しないため、実質的にノーオペレーションです。HTTPS オリジンで自己署名証明書を使う場合にのみ `true` に設定してください。HTTP オリジンでは明示的に `false` を指定するか、`originRequest` ブロック自体を省略しても構いません。
 
 ### 設定の検証
 
@@ -199,6 +208,7 @@ After=network.target
 
 [Service]
 # サーバーにログインしている一般ユーザーを指定することを推奨（例: ubuntu / debian）
+# 本番環境では専用ユーザー（pythonbbs など）の作成を検討してください
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/pythonbbs
@@ -260,6 +270,9 @@ tailnet policy file（管理コンソールの「Access Controls」または `ta
 
 ```json
 {
+  "groups": {
+    "group:admins": ["admin@example.com"]
+  },
   "tagOwners": {
     "tag:pythonbbs-server": ["autogroup:admin"]
   },
@@ -273,9 +286,13 @@ tailnet policy file（管理コンソールの「Access Controls」または `ta
 }
 ```
 
+- `groups`: 管理者グループの定義。ID プロバイダと同期する場合、グループ名は小文字で指定します（`@` 記号は使用不可）
+- `tagOwners`: タグを管理するグループの定義。`autogroup:admin` はすべての Tailscale 管理者を指します
 - `src`: アクセス元（管理者グループ）
 - `dst`: アクセス先（PythonBBS サーバーに付与したタグ）
 - `ip`: 許可するポート（8000: FastAPI、22: SSH）
+
+**`groups` を定義せずに `group:admins` を参照するとポリシーが無効になります。** 手動でグループを定義するか、ID プロバイダと同期している場合は同期されたグループ名を使用してください。あるいは `autogroup:admin` を `src` に指定することで、すべての Tailscale 管理者にアクセスを許可することもできます。
 
 この設定により、**管理者グループに所属するデバイスのみ**が PythonBBS のポート 8000 と SSH にアクセスできます。一般ユーザーのデバイスが同じ tailnet に参加していても、サーバーには到達できません。
 
@@ -338,9 +355,11 @@ sudo ufw status verbose
 
 ## 運用上の注意点
 
-### WebSocket の 100 秒アイドルタイムアウト
+### WebSocket のアイドルタイムアウト
 
-PythonBBS がリアルタイム機能（WebSocket）を使う場合、**Cloudflare は 100 秒間データが流れない接続を切断します**。クライアント側で自動再接続を実装するか、サーバー側で 30 秒ごとに `ws.ping()` を送信してキープアライブしてください:
+PythonBBS がリアルタイム機能（WebSocket）を使う場合、**Cloudflare は一定時間データが流れない接続を切断します**。コミュニティでは「約 100 秒」という値が広く言及されていますが、公式ドキュメントでは正確な秒数はプランによって異なるとされています。Enterprise プランではカスタム設定が可能です。
+
+クライアント側で自動再接続を実装するか、サーバー側で 30 秒ごとに `ws.ping()` を送信してキープアライブしてください:
 
 ```python
 import asyncio
@@ -350,7 +369,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            # 30秒ごとに ping を送信（100秒タイムアウト対策）
+            # 30秒ごとに ping を送信（アイドルタイムアウト対策）
             await asyncio.sleep(30)
             await websocket.send_json({"type": "ping"})
     except Exception:
@@ -365,13 +384,17 @@ Cloudflare の無料プランおよび Pro プランでは、**1リクエスト�
 
 掲示板に画像・ファイルのアップロード機能がある場合、この制限に注意してください。100 MB を超えるファイルのアップロードは `413 Request Entity Too Large` エラーになります。
 
-### メディア転送ポリシー
+### メディア転送ポリシー（CDN Service-Specific Terms）
 
-Cloudflare のポリシーでは、**動画・写真などのメディア転送が明示的に禁止**されています。違反するとアカウント停止の可能性があります。大容量のメディアファイルを配信する場合は、Cloudflare R2 や外部のストレージサービスを併用してください。
+Cloudflare の CDN 利用規約（Service-Specific Terms）では、**自前オリジンからの動画配信や、不釣り合いに多い画像・音声などの大規模配信が制限**されています。Tunnel の公開ホスト名（Public Hostname）は Proxied として扱われるため、この規約が適用されます。
+
+Free、Pro、Business プランでは、動画や大容量ファイルの配信に **Cloudflare Stream や R2 などの特定の有料サービス**の使用が要求されます。違反するとリダイレクトや制限の対象になり得ます。大容量メディアを配信する場合は、R2 や Stream の併用を推奨します。
 
 ### トンネルあたりの接続数制限
 
-無料プランでは、**トンネルあたりのアクティブ接続数が最大 100** に制限されています。通常の掲示板運用では問題になりませんが、同時接続ユーザーが多い場合は注意が必要です。
+**1つのトンネルに接続できる `cloudflared` レプリカは最大 25 です。** 各レプリカが Cloudflare Edge へ 4 本のコネクションを張るため、Edge 側では最大 100 コネクションとなります。
+
+**これは HA（高可用性）用のレプリカ数制限であり、同時ユーザー数の制限ではありません。** Tunnel 自体にユーザー同時接続数の上限は存在しません。
 
 ---
 
@@ -420,15 +443,22 @@ Cloudflare のポリシーでは、**動画・写真などのメディア転送�
 | Gunicorn + Uvicorn | ASGI 本番サーバー（`main:app`） | ローカル |
 | UFW | インバウンド完全拒否 | ホスト |
 
-この構成により、**ポート開放なし・固定 IP 不要**で掲示板を公開しつつ、オリジンサーバーの IP を完全に秘匿できます。Cloudflare の無料枠の制限（100 MB アップロード、メディア転送禁止、100 秒 WebSocket タイムアウト）を理解した上で運用してください。
+この構成により、**ポート開放なし・固定 IP 不要**で掲示板を公開しつつ、オリジンサーバーの IP を完全に秘匿できます。Cloudflare の無料枠の制限（100 MB アップロード、大規模メディア配信の制限、WebSocket アイドルタイムアウト）を理解した上で運用してください。
 
 ---
 
 ## 反映した修正点
 
-| # | 修正内容 | 反映箇所 |
-|---|---|---|
-| 1 | Gunicorn ターゲットを `app:app` → `main:app` に修正 | Step 3 の起動コマンド、systemd ユニット |
-| 2 | systemd の `User` を `ubuntu` に変更し、`www-data` 使用時の注釈を追加 | Step 3 の systemd ユニット |
-| 3 | `tagOwners` が必須であることを強調 | Step 4 の Grants 設定例の直後 |
-| 4 | `noTLSVerify: true` の理由をコメントで補足 | Step 2 の config.yml |
+| # | 修正内容 | 反映箇所 | 根拠 |
+|---|---|---|---|
+| 1 | 接続数制限を「25 レプリカ / 100 接続」に修正し、ユーザー同時接続数ではないと明記 | 運用上の注意点 | Cloudflare 公式ドキュメント |
+| 2 | メディアポリシーを「Service-Specific Terms に基づく制限」として表現を緩和し、R2 / Stream の併用を推奨 | 運用上の注意点 | Cloudflare 公式 FAQ |
+| 3 | `noTLSVerify` のコメントを「HTTPS origin の場合に使用。HTTP では不要」に修正 | Step 2 の config.yml | cloudflared 仕様 |
+| 4 | Grants 例に `groups` セクションを追加し、`group:admins` の定義漏れを解消 | Step 4 の Grants 設定例 | Tailscale 公式 |
+| 5 | `~/.cloudflared` ディレクトリの権限を 700 に設定する手順を追加 | Step 2 の認証情報セキュリティ | セキュリティベストプラクティス |
+| 6 | systemd の `User` に「本番では専用ユーザーを検討」の注記を追加 | Step 3 の systemd ユニット | 運用ベストプラクティス |
+| 7 | WebSocket の「100 秒」を「約 100 秒（プランにより異なる）」に表現を弱和 | 運用上の注意点 | Cloudflare 公式（正確な秒数は非公開） |
+
+---
+
+ファイル名は `pythonbbs-production-guide.md` として保存してください。外側を4連バッククォートにしているので、内側のコードブロックは正しく保持されます。
